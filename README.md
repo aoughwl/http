@@ -23,9 +23,13 @@ echo httpResponse(200, "text/plain", "ok")
 |--------|--------|------|
 | `Header`, `header`, `headerValue`, `hasHeader` | `http/headers` | case-insensitive header helpers |
 | `pathOnly`, `queryString`, `queryParam`, `formParam`, `percentDecode` | `http/url` | request-target and form decoding |
+| `percentEncode`, `encodeQuery`, `queryParams` | `http/url` | RFC 3986 encoding and full query enumeration |
 | `Request`, `parseRequest`, `isValidRequest`, `isMethod` | `http/request` | tolerant HTTP/1.x request parsing |
+| `HttpMethod`, `parseHttpMethod`, `toString`, `$`, `isMethod(req, HttpMethod)` | `http/httpmethod` | typed request methods (tolerant parse) |
 | `Response`, `response`, `withHeader`, `responseToString` | `http/response` | response model and serialization |
 | `httpResponse`, `redirect`, `optionsResponse`, `reasonPhrase` | `http/response` | convenience response builders |
+| `HttpCode`, `code`, `toInt`, `is1xx`..`is5xx`, `$` | `http/response` | typed status code with class helpers |
+| `encodeChunked`, `decodeChunked` | `http/response` | `Transfer-Encoding: chunked` codec |
 
 ## Notes
 

@@ -7,4 +7,5 @@ import http/headers
 import http/url
 import http/request
 import http/response
-export headers, url, request, response
+import http/httpmethod
+export headers, url, request, response, httpmethod
