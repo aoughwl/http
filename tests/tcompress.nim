@@ -1,7 +1,7 @@
 ## tcompress.nim — gzip + Brotli round-trips and Content-Encoding negotiation.
 
 import std/syncio
-import http/compress
+import http/contentcoding
 
 proc check(cond: bool; msg: string) =
   if not cond:

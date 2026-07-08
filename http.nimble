@@ -6,3 +6,4 @@ license     = "MIT"
 srcDir      = "."
 
 # No third-party requires: stdlib only.
+requires "compress"
