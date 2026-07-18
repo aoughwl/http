@@ -8,4 +8,5 @@ import http/url
 import http/request
 import http/response
 import http/httpmethod
-export headers, url, request, response, httpmethod
+import http/stream
+export headers, url, request, response, httpmethod, stream
