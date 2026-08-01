@@ -24,6 +24,8 @@
 import headers
 import request
 import response
+import parserlimits
+export parserlimits
 
 type
   StreamKind* = enum
@@ -47,10 +49,7 @@ type
     state*: StreamState
     lineBuf: string          ## bytes of the current line, CR/LF excluded
     headerBytes: int         ## running size of the header block (limit guard)
-    maxLine: int             ## max bytes in any single line
-    maxHeaderBytes: int      ## max total header-block size
-    maxHeaderCount: int      ## max number of header fields; 0 = unlimited
-    maxBody: int             ## max decoded body bytes; 0 = unlimited
+    lim: ParserLimits        ## the resource bounds in force; see parserlimits
     # --- parsed head ---
     meth*: string            ## request method (request only)
     target*: string          ## request-target/path (request only)
@@ -69,11 +68,10 @@ type
     errorStatus*: int        ## 0 when healthy; else an HTTP status code
     errorMsg*: string
 
-proc initParser(kind: StreamKind): StreamParser =
+proc initParser(kind: StreamKind; lim: ParserLimits): StreamParser =
   result = StreamParser(
     kind: kind, state: ssLine, lineBuf: "", headerBytes: 0,
-    maxLine: 8192, maxHeaderBytes: 65536,
-    maxHeaderCount: 128, maxBody: 64 * 1024 * 1024,
+    lim: lim,
     meth: "", target: "", version: "", status: 0, reason: "",
     headers: @[], headComplete: false,
     chunked: false, eofDelimited: false, remaining: 0,
@@ -81,30 +79,44 @@ proc initParser(kind: StreamKind): StreamParser =
 
 proc newRequestParser*(): StreamParser =
   ## A parser that expects an HTTP request (method / target / version first).
-  initParser(skRequest)
+  initParser(skRequest, defaultParserLimits())
 
 proc newResponseParser*(): StreamParser =
   ## A parser that expects an HTTP response (version / status / reason first).
-  initParser(skResponse)
+  initParser(skResponse, defaultParserLimits())
+
+proc newRequestParser*(lim: ParserLimits): StreamParser =
+  ## A request parser under an explicit policy. This is the entry point a
+  ## server uses: it builds the parser, so the caller who wants to bound it has
+  ## to be able to say so up front rather than adjusting it afterwards.
+  initParser(skRequest, lim)
+
+proc newResponseParser*(lim: ParserLimits): StreamParser =
+  ## A response parser under an explicit policy.
+  initParser(skResponse, lim)
+
+proc setLimits*(p: var StreamParser; lim: ParserLimits) =
+  ## Replace the bounds wholesale. Merge against `p.limits()` first if you mean
+  ## to change only some of them.
+  p.lim = lim
 
 proc withLimits*(p: var StreamParser; maxLine, maxHeaderBytes: int) =
-  ## Override the default line (8192) and header-block (65536) byte limits.
-  if maxLine > 0: p.maxLine = maxLine
-  if maxHeaderBytes > 0: p.maxHeaderBytes = maxHeaderBytes
+  ## Override the default line and header-block byte limits.
+  if maxLine > 0: p.lim.maxLine = maxLine
+  if maxHeaderBytes > 0: p.lim.maxHeaderBytes = maxHeaderBytes
 
 proc withBodyLimits*(p: var StreamParser; maxHeaderCount, maxBody: int) =
-  ## Override the header-count (128) and decoded-body-byte (64 MiB) limits.
+  ## Override the header-count and decoded-body-byte limits.
   ## `maxHeaderBytes` bounds the header block's size but not how many fields it
   ## splits into, and before this nothing bounded the body at all: `feed` grew
   ## `bodyBuf` for as long as the peer kept sending. Pass 0 for unlimited.
-  if maxHeaderCount >= 0: p.maxHeaderCount = maxHeaderCount
-  if maxBody >= 0: p.maxBody = maxBody
+  if maxHeaderCount >= 0: p.lim.maxHeaderCount = maxHeaderCount
+  if maxBody >= 0: p.lim.maxBody = maxBody
 
-proc limits*(p: StreamParser): tuple[maxLine, maxHeaderBytes, maxHeaderCount,
-                                     maxBody: int] =
+proc limits*(p: StreamParser): ParserLimits =
   ## The limits currently in force — readable, so "the default plus one change"
   ## does not mean re-hardcoding the defaults.
-  (p.maxLine, p.maxHeaderBytes, p.maxHeaderCount, p.maxBody)
+  p.lim
 
 # --- small char helpers (no slices, no raises) -------------------------------
 
@@ -157,7 +169,7 @@ proc setError(p: var StreamParser; status: int; msg: string) =
 proc checkBodyLimit(p: var StreamParser) =
   ## Nothing used to bound the decoded body: an eof-delimited response or a
   ## chunked stream grew `bodyBuf` for as long as the peer kept sending.
-  if p.maxBody > 0 and p.bodyTotal > p.maxBody:
+  if exceeds(p.lim.maxBody, p.bodyTotal):
     setError(p, 413, "body too large")
 
 # --- head parsing ------------------------------------------------------------
@@ -220,7 +232,7 @@ proc beginBody(p: var StreamParser) =
     if not ok or n < 0:
       setError(p, 400, "bad Content-Length")
       return
-    if p.maxBody > 0 and n > p.maxBody:
+    if exceeds(p.lim.maxBody, n):
       # reject a declared Content-Length up front rather than after streaming
       # the whole thing into memory
       setError(p, 413, "body too large")
@@ -275,9 +287,9 @@ proc processLine(p: var StreamParser) =
       beginBody(p)
     else:
       p.headerBytes = p.headerBytes + p.lineBuf.len + 2
-      if p.headerBytes > p.maxHeaderBytes:
+      if exceeds(p.lim.maxHeaderBytes, p.headerBytes):
         setError(p, 431, "header block too large")
-      elif p.maxHeaderCount > 0 and p.headers.len >= p.maxHeaderCount:
+      elif exceeds(p.lim.maxHeaderCount, p.headers.len + 1):
         # many tiny fields stay under maxHeaderBytes while still blowing up
         # every downstream per-header loop, so bound the count as well
         setError(p, 431, "too many header fields")
@@ -286,6 +298,7 @@ proc processLine(p: var StreamParser) =
   of ssChunkSize:
     var size = 0
     var any = false
+    var tooBig = false
     var i = 0
     while i < p.lineBuf.len:
       let d = hexDigit(p.lineBuf[i])
@@ -293,7 +306,16 @@ proc processLine(p: var StreamParser) =
       size = size * 16 + d
       any = true
       inc i
-    if not any:
+      # The accumulation itself has to be bounded, not just the result. A chunk
+      # header of sixteen 'f's overflows the accumulator and lands on a
+      # *negative* size, which the framing below then reads as a short chunk —
+      # so the check goes inside the loop and stops as soon as it trips.
+      if exceeds(p.lim.maxChunkSize, size) or size < 0:
+        tooBig = true
+        break
+    if tooBig:
+      setError(p, 413, "chunk too large")
+    elif not any:
       setError(p, 400, "bad chunk size")
     elif size == 0:
       # Final chunk: consume trailers up to the next blank line.
@@ -330,7 +352,7 @@ proc feed*(p: var StreamParser; data: string): int =
         discard  # CR is a line-ending artifact; real content has no bare CR
       else:
         p.lineBuf.add c
-        if p.lineBuf.len > p.maxLine:
+        if exceeds(p.lim.maxLine, p.lineBuf.len):
           setError(p, 431, "line too long")
     elif p.state == ssBody:
       if p.eofDelimited:
