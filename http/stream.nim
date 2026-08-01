@@ -49,6 +49,8 @@ type
     headerBytes: int         ## running size of the header block (limit guard)
     maxLine: int             ## max bytes in any single line
     maxHeaderBytes: int      ## max total header-block size
+    maxHeaderCount: int      ## max number of header fields; 0 = unlimited
+    maxBody: int             ## max decoded body bytes; 0 = unlimited
     # --- parsed head ---
     meth*: string            ## request method (request only)
     target*: string          ## request-target/path (request only)
@@ -71,6 +73,7 @@ proc initParser(kind: StreamKind): StreamParser =
   result = StreamParser(
     kind: kind, state: ssLine, lineBuf: "", headerBytes: 0,
     maxLine: 8192, maxHeaderBytes: 65536,
+    maxHeaderCount: 128, maxBody: 64 * 1024 * 1024,
     meth: "", target: "", version: "", status: 0, reason: "",
     headers: @[], headComplete: false,
     chunked: false, eofDelimited: false, remaining: 0,
@@ -88,6 +91,20 @@ proc withLimits*(p: var StreamParser; maxLine, maxHeaderBytes: int) =
   ## Override the default line (8192) and header-block (65536) byte limits.
   if maxLine > 0: p.maxLine = maxLine
   if maxHeaderBytes > 0: p.maxHeaderBytes = maxHeaderBytes
+
+proc withBodyLimits*(p: var StreamParser; maxHeaderCount, maxBody: int) =
+  ## Override the header-count (128) and decoded-body-byte (64 MiB) limits.
+  ## `maxHeaderBytes` bounds the header block's size but not how many fields it
+  ## splits into, and before this nothing bounded the body at all: `feed` grew
+  ## `bodyBuf` for as long as the peer kept sending. Pass 0 for unlimited.
+  if maxHeaderCount >= 0: p.maxHeaderCount = maxHeaderCount
+  if maxBody >= 0: p.maxBody = maxBody
+
+proc limits*(p: StreamParser): tuple[maxLine, maxHeaderBytes, maxHeaderCount,
+                                     maxBody: int] =
+  ## The limits currently in force — readable, so "the default plus one change"
+  ## does not mean re-hardcoding the defaults.
+  (p.maxLine, p.maxHeaderBytes, p.maxHeaderCount, p.maxBody)
 
 # --- small char helpers (no slices, no raises) -------------------------------
 
@@ -136,6 +153,12 @@ proc setError(p: var StreamParser; status: int; msg: string) =
   p.state = ssError
   p.errorStatus = status
   p.errorMsg = msg
+
+proc checkBodyLimit(p: var StreamParser) =
+  ## Nothing used to bound the decoded body: an eof-delimited response or a
+  ## chunked stream grew `bodyBuf` for as long as the peer kept sending.
+  if p.maxBody > 0 and p.bodyTotal > p.maxBody:
+    setError(p, 413, "body too large")
 
 # --- head parsing ------------------------------------------------------------
 
@@ -197,6 +220,11 @@ proc beginBody(p: var StreamParser) =
     if not ok or n < 0:
       setError(p, 400, "bad Content-Length")
       return
+    if p.maxBody > 0 and n > p.maxBody:
+      # reject a declared Content-Length up front rather than after streaming
+      # the whole thing into memory
+      setError(p, 413, "body too large")
+      return
     p.remaining = n
     if n == 0:
       p.state = ssComplete
@@ -249,6 +277,10 @@ proc processLine(p: var StreamParser) =
       p.headerBytes = p.headerBytes + p.lineBuf.len + 2
       if p.headerBytes > p.maxHeaderBytes:
         setError(p, 431, "header block too large")
+      elif p.maxHeaderCount > 0 and p.headers.len >= p.maxHeaderCount:
+        # many tiny fields stay under maxHeaderBytes while still blowing up
+        # every downstream per-header loop, so bound the count as well
+        setError(p, 431, "too many header fields")
       else:
         parseHeaderLine(p)
   of ssChunkSize:
@@ -315,6 +347,7 @@ proc feed*(p: var StreamParser; data: string): int =
           dec p.remaining
         if p.remaining == 0:
           p.state = ssComplete
+      checkBodyLimit(p)
     elif p.state == ssChunkData:
       while i < data.len and p.remaining > 0:
         p.bodyBuf.add data[i]
@@ -323,6 +356,7 @@ proc feed*(p: var StreamParser; data: string): int =
         dec p.remaining
       if p.remaining == 0:
         p.state = ssChunkDataEnd
+      checkBodyLimit(p)
     elif p.state == ssChunkDataEnd:
       let c = data[i]
       inc i
