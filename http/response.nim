@@ -105,6 +105,130 @@ proc response*(status: int; contentType: string; body: string): Response =
 proc withHeader*(res: var Response; name, value: string) =
   res.headers.add Header(name: name, value: value)
 
+# ---------------------------------------------------------------------------
+# parsing — the mirror of `parseRequest`, for anything acting as a CLIENT
+# ---------------------------------------------------------------------------
+
+proc respLineEnd(raw: string; start: int): int =
+  result = start
+  while result < raw.len and raw[result] != '\r' and raw[result] != '\n':
+    inc result
+
+proc respNextLine(raw: string; i: var int) =
+  while i < raw.len and raw[i] != '\r' and raw[i] != '\n':
+    inc i
+  if i < raw.len and raw[i] == '\r':
+    inc i
+    if i < raw.len and raw[i] == '\n': inc i
+  elif i < raw.len and raw[i] == '\n':
+    inc i
+
+proc respCopyRange(raw: string; a, b: int): string =
+  result = ""
+  var i = a
+  while i < b and i < raw.len:
+    result.add raw[i]
+    inc i
+
+proc respTrim(s: string): string =
+  var a = 0
+  var b = s.len
+  while a < b and (s[a] == ' ' or s[a] == '\t'): inc a
+  while b > a and (s[b-1] == ' ' or s[b-1] == '\t'): dec b
+  respCopyRange(s, a, b)
+
+proc parseStatusLine*(raw: string; version: var string; status: var int;
+                      reason: var string): int =
+  ## Parse `HTTP/1.1 200 OK`, returning the offset just past the line (or -1 if
+  ## there is no complete line yet). `status` is 0 when the line is malformed —
+  ## a parser for the wire never raises, it reports.
+  version = ""
+  status = 0
+  reason = ""
+  if raw.len == 0:
+    return -1
+  let stop = respLineEnd(raw, 0)
+  if stop >= raw.len:
+    return -1                       # no line terminator yet: incomplete
+  var i = 0
+  while i < stop and raw[i] != ' ': inc i
+  version = respCopyRange(raw, 0, i)
+  while i < stop and raw[i] == ' ': inc i
+  var d = 0
+  var any = false
+  while i < stop and raw[i] >= '0' and raw[i] <= '9':
+    d = d * 10 + (ord(raw[i]) - ord('0'))
+    any = true
+    inc i
+  if any:
+    status = d
+  while i < stop and raw[i] == ' ': inc i
+  reason = respCopyRange(raw, i, stop)
+  var k = stop
+  respNextLine(raw, k)
+  return k
+
+proc parseResponse*(raw: string): Response =
+  ## Parse a complete HTTP/1.x response: status line, headers, and everything
+  ## after the first blank line as body. Malformed input yields empty fields
+  ## rather than an error — the caller checks `status`.
+  ##
+  ## Transfer framing is NOT applied here: a chunked body arrives chunked, and
+  ## `decodeChunked` is the caller's next step. Keeping the two apart is what
+  ## lets a streaming client parse headers before the body has arrived.
+  result = Response(status: 0, contentType: "", headers: @[], body: "")
+  var version = ""
+  var status = 0
+  var reason = ""
+  let afterLine = parseStatusLine(raw, version, status, reason)
+  if afterLine < 0:
+    return result
+  result.status = status
+  var i = afterLine
+  var doneHeaders = false
+  while i < raw.len and not doneHeaders:
+    let start = i
+    let stop = respLineEnd(raw, start)
+    if stop == start:
+      doneHeaders = true
+      respNextLine(raw, i)
+    else:
+      var colon = start
+      while colon < stop and raw[colon] != ':':
+        inc colon
+      if colon < stop:
+        let name = respTrim(respCopyRange(raw, start, colon))
+        let value = respTrim(respCopyRange(raw, colon + 1, stop))
+        if name.len > 0:
+          result.headers.add Header(name: name, value: value)
+          if eqIgnoreCase(name, "Content-Type"):
+            result.contentType = value
+      i = stop
+      respNextLine(raw, i)
+  while i < raw.len:
+    result.body.add raw[i]
+    inc i
+
+proc headerValue*(res: Response; name: string): string =
+  headerValue(res.headers, name)
+
+proc hasHeader*(res: Response; name: string): bool =
+  hasHeader(res.headers, name)
+
+proc responseHeaderEnd*(raw: string): int =
+  ## Offset just past the blank line that ends the header block, or -1 while it
+  ## has not arrived. A client reads until this is >= 0, then decides from
+  ## `Content-Length` / `Transfer-Encoding` how much body is still owed.
+  var i = 0
+  while i < raw.len:
+    if i + 3 < raw.len and raw[i] == '\r' and raw[i+1] == '\n' and
+       raw[i+2] == '\r' and raw[i+3] == '\n':
+      return i + 4
+    if i + 1 < raw.len and raw[i] == '\n' and raw[i+1] == '\n':
+      return i + 2
+    inc i
+  return -1
+
 proc responseToString*(res: Response; includeBody = true): string =
   ## Build a complete HTTP/1.1 response. Adds `Content-Type`, `Content-Length`,
   ## and `Connection: close` unless the caller already supplied those headers.
