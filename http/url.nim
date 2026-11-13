@@ -135,3 +135,112 @@ proc encodeQuery*(pairs: openArray[(string, string)]): string =
     result.add '='
     result.add percentEncode(p[1], true)
     inc i
+
+# --- absolute URLs (the client side) ---------------------------------------------
+
+type
+  ParsedUrl* = object
+    ## `splitUrl`'s answer. `ok` false means `err` says why and nothing else is set.
+    ok*: bool
+    err*: string
+    scheme*: string      ## lower-case: http, https, ws or wss
+    secure*: bool        ## https or wss
+    host*: string        ## without brackets (an IPv6 literal comes back bare)
+    port*: int           ## explicit, or the scheme's default (80 / 443)
+    target*: string      ## path + query, always starts with '/', fragment dropped
+    hostHeader*: string  ## for the Host: line: brackets back on IPv6, ":port" only if not the default
+
+proc urlFail(msg: string): ParsedUrl =
+  ParsedUrl(ok: false, err: msg, scheme: "", secure: false, host: "", port: 0,
+            target: "/", hostHeader: "")
+
+proc lowerCopy(s: string): string =
+  result = ""
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c >= 'A' and c <= 'Z': result.add chr(ord(c) + 32)
+    else: result.add c
+    inc i
+
+proc copyBetween(s: string; a, b: int): string =
+  ## [a, b)
+  result = ""
+  var i = a
+  while i < b and i < s.len:
+    result.add s[i]
+    inc i
+
+proc splitUrl*(url: string): ParsedUrl =
+  ## scheme://[user@]host[:port][/path][?query][#fragment] for http, https, ws, wss. Handles IPv6
+  ## literals ("[::1]:8080"), default ports, a query with no path ("http://h?x=1" -> "/?x=1") and
+  ## URLs of any length. Spaces and control bytes are refused (they would break the request line).
+  ## A user:password part is skipped, not returned: send credentials in a header.
+  var i = 0
+  while i < url.len:
+    let c = ord(url[i])
+    if c <= 32 or c == 127:
+      return urlFail("the url contains a space or a control character")
+    inc i
+  var sep = -1
+  i = 0
+  while i + 2 < url.len and sep < 0:
+    if url[i] == ':' and url[i + 1] == '/' and url[i + 2] == '/': sep = i
+    inc i
+  if sep <= 0: return urlFail("the url has no scheme")
+  let scheme = lowerCopy(copyBetween(url, 0, sep))
+  var defPort = 0
+  if scheme == "http" or scheme == "ws": defPort = 80
+  elif scheme == "https" or scheme == "wss": defPort = 443
+  else: return urlFail("unsupported url scheme " & scheme)
+  let a = sep + 3
+  var e = a
+  while e < url.len and url[e] != '/' and url[e] != '?' and url[e] != '#': inc e
+  var auth = copyBetween(url, a, e)
+  var at = -1
+  var k = 0
+  while k < auth.len:
+    if auth[k] == '@': at = k
+    inc k
+  if at >= 0: auth = copyBetween(auth, at + 1, auth.len)
+  var host = ""
+  var portText = ""
+  var v6 = false
+  if auth.len > 0 and auth[0] == '[':
+    var c = 1
+    while c < auth.len and auth[c] != ']': inc c
+    if c >= auth.len: return urlFail("the url has an unterminated IPv6 address")
+    host = copyBetween(auth, 1, c)
+    v6 = true
+    if c + 1 < auth.len:
+      if auth[c + 1] != ':': return urlFail("the url has text after the IPv6 address")
+      portText = copyBetween(auth, c + 2, auth.len)
+  else:
+    var c = 0
+    while c < auth.len and auth[c] != ':': inc c
+    host = copyBetween(auth, 0, c)
+    if c < auth.len: portText = copyBetween(auth, c + 1, auth.len)
+  if host.len == 0: return urlFail("the url has no host")
+  var port = defPort
+  if portText.len > 0:
+    if portText.len > 5: return urlFail("the url has an invalid port")
+    var v = 0
+    var j = 0
+    while j < portText.len:
+      let d = portText[j]
+      if d < '0' or d > '9': return urlFail("the url has an invalid port")
+      v = v * 10 + (ord(d) - ord('0'))
+      inc j
+    if v < 1 or v > 65535: return urlFail("the url has an invalid port")
+    port = v
+  var hh = host
+  if v6: hh = "[" & host & "]"
+  if port != defPort: hh = hh & ":" & $port
+  var f = e
+  while f < url.len and url[f] != '#': inc f
+  var target = copyBetween(url, e, f)
+  if target.len == 0: target = "/"
+  elif target[0] == '?': target = "/" & target
+  ParsedUrl(ok: true, err: "", scheme: scheme,
+            secure: scheme == "https" or scheme == "wss", host: host, port: port,
+            target: target, hostHeader: hh)

@@ -57,6 +57,9 @@ type
     status*: int             ## status code (response only)
     reason*: string          ## reason phrase (response only)
     headers*: seq[Header]
+    trailers*: seq[Header]   ## fields after the last chunk (chunked bodies only)
+    interim*: int            ## 1xx heads (100, 103, ...) skipped before the final one
+    reqMethod: string        ## the request this response answers (see setRequestMethod)
     headComplete*: bool      ## request/status line + headers fully parsed
     # --- body framing ---
     chunked: bool
@@ -73,7 +76,7 @@ proc initParser(kind: StreamKind; lim: ParserLimits): StreamParser =
     kind: kind, state: ssLine, lineBuf: "", headerBytes: 0,
     lim: lim,
     meth: "", target: "", version: "", status: 0, reason: "",
-    headers: @[], headComplete: false,
+    headers: @[], trailers: @[], interim: 0, reqMethod: "", headComplete: false,
     chunked: false, eofDelimited: false, remaining: 0,
     bodyBuf: "", bodyTotal: 0, errorStatus: 0, errorMsg: "")
 
@@ -113,6 +116,12 @@ proc withBodyLimits*(p: var StreamParser; maxHeaderCount, maxBody: int) =
   if maxHeaderCount >= 0: p.lim.maxHeaderCount = maxHeaderCount
   if maxBody >= 0: p.lim.maxBody = maxBody
 
+proc setRequestMethod*(p: var StreamParser; meth: string) =
+  ## Tell a response parser which request it answers. A response to HEAD has the headers of the
+  ## GET (Content-Length included) and no body at all, and without this the parser would wait for
+  ## bytes that never come. 1xx, 204 and 304 are body-less whatever the method.
+  p.reqMethod = meth
+
 proc limits*(p: StreamParser): ParserLimits =
   ## The limits currently in force — readable, so "the default plus one change"
   ## does not mean re-hardcoding the defaults.
@@ -134,14 +143,51 @@ proc parseDecimal(s: string; ok: var bool): int =
   while i < s.len and (s[i] == ' ' or s[i] == '\t'):
     inc i
   var any = false
+  var digits = 0
   while i < s.len and s[i] >= '0' and s[i] <= '9':
-    result = result * 10 + (ord(s[i]) - ord('0'))
+    # 15 digits is plenty for a length (10^15 bytes) and cannot overflow: a 20-digit value used
+    # to wrap int64 and could land on a small number (2^64 + 5 read as 5).
+    inc digits
+    if digits <= 15:
+      result = result * 10 + (ord(s[i]) - ord('0'))
     any = true
     inc i
   while i < s.len and (s[i] == ' ' or s[i] == '\t'):
     inc i
-  if any and i >= s.len:
+  if any and i >= s.len and digits <= 15:
     ok = true
+
+proc contentLengthOf(hs: seq[Header]; ok: var bool): int =
+  ## The Content-Length of a message. Several Content-Length fields, or a comma list in one, are
+  ## accepted only when every item is the same number (RFC 7230 3.3.2); a malformed or
+  ## disagreeing set is `ok = false`.
+  ok = true
+  var want = -1
+  var i = 0
+  while i < hs.len:
+    if eqIgnoreCase(hs[i].name, "Content-Length"):
+      let v = hs[i].value
+      var a = 0
+      while a <= v.len:
+        var b = a
+        var item = ""
+        while b < v.len and v[b] != ',':
+          item.add v[b]
+          inc b
+        var itemOk = false
+        let n = parseDecimal(item, itemOk)
+        if not itemOk:
+          ok = false
+          return 0
+        if want < 0:
+          want = n
+        elif want != n:
+          ok = false
+          return 0
+        a = b + 1
+    inc i
+  if want < 0: want = 0
+  return want
 
 proc containsCI(hay, needle: string): bool =
   ## Case-insensitive substring test (needle assumed already lower-case).
@@ -194,6 +240,18 @@ proc parseRequestLine(p: var StreamParser) =
   if p.meth.len == 0 or p.target.len == 0:
     setError(p, 400, "malformed request line")
 
+proc startsWithHttp(v: string): bool =
+  ## "HTTP/" in any case: the version token of a status line (anything else is not HTTP).
+  if v.len < 5: return false
+  var k = 0
+  let want = "http/"
+  while k < 5:
+    var c = v[k]
+    if c >= 'A' and c <= 'Z': c = chr(ord(c) + 32)
+    if c != want[k]: return false
+    inc k
+  return true
+
 proc parseStatusLine(p: var StreamParser) =
   let raw = p.lineBuf
   var i = 0
@@ -213,11 +271,31 @@ proc parseStatusLine(p: var StreamParser) =
   while i < raw.len:
     p.reason.add raw[i]
     inc i
-  if p.version.len == 0 or not any:
+  if p.version.len < 6 or not any or not startsWithHttp(p.version):
     setError(p, 400, "malformed status line")
 
 proc beginBody(p: var StreamParser) =
   ## Decide body framing once the header block is complete.
+  if p.kind == skResponse:
+    if p.status >= 100 and p.status < 200 and p.status != 101:
+      # An interim head (100 Continue, 103 Early Hints): not the answer. Forget it and parse the
+      # next head; before this the 1xx was taken as the response and the real one became its body.
+      inc p.interim
+      p.headers = @[]
+      p.version = ""
+      p.status = 0
+      p.reason = ""
+      p.headerBytes = 0
+      p.lineBuf = ""
+      p.state = ssLine
+      return
+    if p.status == 101 or p.status == 204 or p.status == 304 or
+       eqIgnoreCase(p.reqMethod, "HEAD") or
+       (eqIgnoreCase(p.reqMethod, "CONNECT") and p.status >= 200 and p.status < 300):
+      # No body whatever the headers say: Content-Length on a HEAD/304 describes the GET.
+      p.headComplete = true
+      p.state = ssComplete
+      return
   p.headComplete = true
   let te = headerValue(p.headers, "Transfer-Encoding")
   if te.len > 0 and containsCI(te, "chunked"):
@@ -228,7 +306,7 @@ proc beginBody(p: var StreamParser) =
   let cl = headerValue(p.headers, "Content-Length")
   if cl.len > 0:
     var ok = false
-    let n = parseDecimal(cl, ok)
+    let n = contentLengthOf(p.headers, ok)
     if not ok or n < 0:
       setError(p, 400, "bad Content-Length")
       return
@@ -254,6 +332,17 @@ proc beginBody(p: var StreamParser) =
 
 proc parseHeaderLine(p: var StreamParser) =
   let raw = p.lineBuf
+  if raw.len > 0 and (raw[0] == ' ' or raw[0] == '\t') and p.headers.len > 0:
+    # obs-fold (RFC 7230 3.2.4): a line that starts with space/tab continues the previous field
+    # (joined with one space). Before, it was dropped or, if it had a colon, became a bogus header.
+    let more = trimHttp(raw)
+    if more.len > 0:
+      let last = p.headers.len - 1
+      var h = p.headers[last]
+      if h.value.len > 0: h.value = h.value & " " & more
+      else: h.value = more
+      p.headers[last] = h
+    return
   var colon = 0
   while colon < raw.len and raw[colon] != ':':
     inc colon
@@ -326,7 +415,32 @@ proc processLine(p: var StreamParser) =
   of ssTrailer:
     if p.lineBuf.len == 0:
       p.state = ssComplete
-    # else: trailer header line, ignored.
+    else:
+      # A trailer field: kept in `trailers`, bounded like the header block.
+      p.headerBytes = p.headerBytes + p.lineBuf.len + 2
+      if exceeds(p.lim.maxHeaderBytes, p.headerBytes):
+        setError(p, 431, "trailer block too large")
+      elif exceeds(p.lim.maxHeaderCount, p.trailers.len + 1):
+        setError(p, 431, "too many trailer fields")
+      else:
+        let raw = p.lineBuf
+        var colon = 0
+        while colon < raw.len and raw[colon] != ':':
+          inc colon
+        if colon > 0 and colon < raw.len:
+          var name = ""
+          var k = 0
+          while k < colon:
+            name.add raw[k]
+            inc k
+          var value = ""
+          k = colon + 1
+          while k < raw.len:
+            value.add raw[k]
+            inc k
+          let tn = trimHttp(name)
+          if tn.len > 0:
+            p.trailers.add Header(name: tn, value: trimHttp(value))
   else:
     discard
 
@@ -385,7 +499,10 @@ proc feed*(p: var StreamParser; data: string): int =
       if c == '\n':
         p.lineBuf = ""
         p.state = ssChunkSize
-      # ignore \r (and tolerate a lone \n)
+      elif c != '\r':
+        # Exactly CRLF (or a lone LF) ends a chunk. Any other byte means the framing is off by
+        # some bytes; skipping to the next LF used to hide that and return wrong data.
+        setError(p, 400, "chunk data not followed by CRLF")
     else:
       discard
   return i

@@ -90,3 +90,56 @@ proc headerValue*(req: Request; name: string): string =
 
 proc hasHeader*(req: Request; name: string): bool =
   hasHeader(req.headers, name)
+
+proc isTokenName(s: string): bool =
+  ## RFC 7230 token: what a method or a header field name may be made of.
+  if s.len == 0: return false
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    let o = ord(c)
+    var ok = false
+    if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'): ok = true
+    elif o > 32 and o < 127:
+      if c == '!' or c == '#' or c == '$' or c == '%' or c == '&' or c == '\'' or c == '*' or c == '+': ok = true
+      elif c == '-' or c == '.' or c == '^' or c == '_' or c == '`' or c == '|' or c == '~': ok = true
+    if not ok: return false
+    inc i
+  return true
+
+proc hasControlByte(s: string): bool =
+  ## CR, LF, NUL or any other control byte except tab, or DEL.
+  var i = 0
+  while i < s.len:
+    let o = ord(s[i])
+    if (o < 32 and o != 9) or o == 127: return true
+    inc i
+  return false
+
+proc requestToString*(meth, target, host: string; headers: seq[Header]; body: string;
+                      closeAfter = false): string =
+  ## The bytes of one HTTP/1.1 request, with no limit on the length of the target, a header or the
+  ## body. Order: request line, Host, `headers` as given, Connection: close (when `closeAfter`),
+  ## Content-Length (body present, or POST/PUT/PATCH), blank line, body. The caller's Host,
+  ## Content-Length, Connection and Transfer-Encoding fields are not sent (this function owns the
+  ## framing). Returns "" when anything is malformed: a method or field name that is not a token,
+  ## or a target, host or value with a CR, LF, NUL or other control byte (nothing can smuggle a
+  ## second request or header).
+  if not isTokenName(meth) or target.len == 0 or host.len == 0: return ""
+  if hasControlByte(target) or hasControlByte(host) or target[0] != '/': return ""
+  var wire = meth & " " & target & " HTTP/1.1\r\nHost: " & host & "\r\n"
+  var i = 0
+  while i < headers.len:
+    let h = headers[i]
+    if not isTokenName(h.name) or hasControlByte(h.value): return ""
+    let low = lowerAscii(h.name)
+    if low != "host" and low != "content-length" and low != "connection" and
+       low != "transfer-encoding":
+      wire.add h.name & ": " & h.value & "\r\n"
+    inc i
+  if closeAfter: wire.add "Connection: close\r\n"
+  if body.len > 0 or meth == "POST" or meth == "PUT" or meth == "PATCH":
+    wire.add "Content-Length: " & $body.len & "\r\n"
+  wire.add "\r\n"
+  wire.add body
+  return wire
