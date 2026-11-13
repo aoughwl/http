@@ -241,6 +241,10 @@ proc splitUrl*(url: string): ParsedUrl =
   var target = copyBetween(url, e, f)
   if target.len == 0: target = "/"
   elif target[0] == '?': target = "/" & target
+  # computed before the constructor: inside it the compiled `or` of two string comparisons came out false
+  var isSecure = false
+  if scheme == "https": isSecure = true
+  elif scheme == "wss": isSecure = true
   ParsedUrl(ok: true, err: "", scheme: scheme,
-            secure: scheme == "https" or scheme == "wss", host: host, port: port,
+            secure: isSecure, host: host, port: port,
             target: target, hostHeader: hh)
